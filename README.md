@@ -11,6 +11,10 @@ A minimal Python container that exercises the Privasys
 | `POST /configure`      | accepts the API key | replaces the key |
 | `GET /protected`       | **503**      | 200 + key length   |
 | `GET /`                | **503**      | 200                |
+| `POST /store/{key}`    | **503**      | store general app data |
+| `GET /store/{key}`     | **503**      | read it back        |
+| `POST /owner-data/{owner_id}/{key}` | **503** | store data-owner data |
+| `GET /owner-data/{owner_id}/{key}`  | **503** | read it back        |
 | any other              | **503** / 404 | 404               |
 
 The freeze is enforced inside the container itself via an in-memory
@@ -45,6 +49,25 @@ restart of the process.
 3. Subsequent requests to `/protected` succeed; verifying clients
    can prove they're talking to a TDX container that saw exactly the
    API key they delivered.
+
+## Stateful data (drives the upgrade-approval scenarios)
+
+All data lives on `/data`, the per-app encrypted volume whose DEK is
+reconstructed from the Enclave Vault constellation at boot (the platform
+never sees the key). Two namespaces, gated by two different key-holders
+when the enclave (mini/virtual) or the app itself is upgraded:
+
+| Namespace | Endpoint | Gated on upgrade by |
+|-----------|----------|---------------------|
+| **App data**        | `POST/GET /store/{key}` | the **app owner** — approves the new measurement; the app storage key is released to it, so `/store` carries forward |
+| **Data-owner data** | `POST/GET /owner-data/{owner_id}/{key}` | **each data owner** independently — approves the new measurement before their slice is readable; a data owner who declines keeps their data locked to the old version |
+
+Both take/return `{"value": "<string>"}`. `GET /store` and
+`GET /owner-data/{owner_id}` list keys. In the full model each data
+owner's slice is wrapped with that owner's vault key (Phase G
+data-owner-keys); here the app provides the data surface and segregation,
+and the per-owner key-wrapping + approval gating is enforced by the
+platform/vault.
 
 ## Restart
 

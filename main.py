@@ -70,7 +70,13 @@ _MANAGER_PORT = 9443
 
 # Bumped per release so the deployed measurement (image digest at OID 3.2)
 # changes and the two versions are distinguishable at runtime via /version.
-APP_VERSION = "1.0.0"
+#
+# v2.0.0 adds GET /insight/{owner_id}: it DERIVES a summary from a data
+# owner's stored data (a new use of their data). Because the measurement
+# changes, each data owner independently approves the v2 measurement against
+# their own vault key before their slice is readable — a data owner who
+# declines keeps their data locked to v1, which has no insight API.
+APP_VERSION = "2.0.0"
 
 _NAME = os.environ.get("PRIVASYS_CONTAINER_NAME", "")
 _TOKEN = os.environ.get("PRIVASYS_CONTAINER_TOKEN", "")
@@ -197,6 +203,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._list_dir(_STORE_DIR)
         elif path.startswith("/owner-data/"):
             self._get_owner_data(path[len("/owner-data/"):])
+        elif path.startswith("/insight/"):
+            self._get_insight(path[len("/insight/"):])
         else:
             self._json(404, {"error": "not found"})
 
@@ -232,6 +240,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self._json(200, {"owner_id": owner_id, "key": key,
                          "value": value.decode("utf-8", "replace")})
+
+    def _get_insight(self, owner_id: str) -> None:
+        """v2 API: derive a summary insight over a data owner's stored data.
+
+        This is the new capability v2 introduces. It reads every record the
+        data owner has stored under /owner-data/{owner_id}/ and returns a
+        derived summary. In the data-owner-key model the owner's slice is
+        only readable here after the owner has approved the v2 measurement
+        against their vault key; otherwise this returns an empty insight.
+        """
+        if not _safe(owner_id):
+            self._json(400, {"error": "invalid owner_id"})
+            return
+        owner_dir = _OWNERS_DIR / owner_id
+        records = 0
+        total_bytes = 0
+        longest = 0
+        fingerprint = hashlib.sha256()
+        try:
+            files = sorted(p for p in owner_dir.iterdir() if p.is_file())
+        except FileNotFoundError:
+            files = []
+        for p in files:
+            blob = p.read_bytes()
+            records += 1
+            total_bytes += len(blob)
+            longest = max(longest, len(blob))
+            fingerprint.update(p.name.encode("utf-8"))
+            fingerprint.update(blob)
+        self._json(200, {
+            "owner_id": owner_id,
+            "app_version": APP_VERSION,
+            "insight": {
+                "records": records,
+                "total_bytes": total_bytes,
+                "longest_value_bytes": longest,
+                "fingerprint": fingerprint.hexdigest(),
+            },
+        })
 
     def _list_dir(self, d: Path, label: str | None = None,
                   label_value: str | None = None) -> None:

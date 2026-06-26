@@ -1,13 +1,13 @@
 # Copyright (c) Privasys. All rights reserved.
 # Licensed under the GNU Affero General Public License v3.0.
 #
-# Build & push the container-app-example image to GHCR. Each push of a
-# `v*` tag produces ghcr.io/privasys/container-app-example:<tag> and a
+# Build & push the container-app-example-with-config image to GHCR. Each push of a
+# `v*` tag produces ghcr.io/privasys/container-app-example-with-config:<tag> and a
 # :<tag>-<sha> immutable tag. Used to exercise the enclave-upgrade flow:
 # deploy one tag, then a second (a code change → a different image digest)
 # to test the vault key gate + app-owner / data-owner promotion.
 
-name: Build & Push container-app-example
+name: Build & Push container-app-example-with-config
 
 on:
   push:
@@ -20,7 +20,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE: ghcr.io/privasys/container-app-example
+  IMAGE: ghcr.io/privasys/container-app-example-with-config
 
 jobs:
   build:

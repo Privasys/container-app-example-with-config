@@ -78,6 +78,7 @@ _MANAGER_PORT = 9443
 # declines keeps their data locked to v1, which has no insight API.
 APP_VERSION = "2.0.0"
 
+_PORT = int(os.environ.get("PORT", "8080"))  # platform assigns a host-net port
 _NAME = os.environ.get("PRIVASYS_CONTAINER_NAME", "")
 _TOKEN = os.environ.get("PRIVASYS_CONTAINER_TOKEN", "")
 
@@ -374,6 +375,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = http.server.HTTPServer(("0.0.0.0", 8080), Handler)
-    print(f"container-app-example listening on :8080 (name={_NAME or '<unset>'})")
+    server = http.server.HTTPServer(("0.0.0.0", _PORT), Handler)
+    print(f"container-app-example listening on :{_PORT} (name={_NAME or '<unset>'})")
     server.serve_forever()

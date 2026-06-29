@@ -1,43 +1,29 @@
-"""Privasys container-app-example.
+"""Privasys container-app-example-with-config.
 
-Demonstrates the configure-then-freeze pattern AND the two kinds of
-stateful data that drive the enclave-upgrade approval flows:
+Reference app for the typed config + actions capabilities on the Privasys
+container runtime. It demonstrates THREE things:
 
-  1. The app boots frozen. Every endpoint other than POST /configure
-     returns 503 with ``{"error": "app is awaiting initial configuration"}``.
-  2. The deployer POSTs ``{"api_key": "..."}`` to /configure. The app
-     a. stores the key under /data/api_key (per-app sealed volume),
-     b. computes SHA-256(api_key),
-     c. POSTs the hash to the local manager
-        ``http://127.0.0.1:9443/api/v1/containers/{name}/attestation-extensions``
-        so the next per-container RA-TLS leaf advertises the commitment
-        under OID ``1.3.6.1.4.1.65230.3.5.1``,
-     d. POSTs ``.../config-complete`` to lift the freeze.
-  3. /protected returns 200 once configured.
-  4. On restart the in-memory ``configured`` flag resets to False.
+  1. CONFIGURE-THEN-FREEZE, gated at the routing layer (NOT in the app).
+     The manifest declares a `config` block whose endpoint is POST /configure.
+     The enclave manager keeps every other path at HTTP 503 until the first
+     successful (2xx) response from /configure, then lifts the gate
+     automatically. The gate re-arms on each restart. This app contains NO
+     freeze flag and NO 503 gating of its own, and it does NOT call
+     `config-complete`: the manager owns the gate.
 
-# Stateful data (drives the upgrade-approval scenarios)
+  2. TYPED ACTIONS. The manifest declares an action `process` with a dynamic
+     enum input (the dataset list is fetched live from GET /datasets) and a
+     progress channel (GET /actions/process/status). The portal, CLI, and MCP
+     render and drive it generically.
 
-Everything below lives on /data, the per-app encrypted volume whose DEK
-is reconstructed from the Enclave Vault constellation at boot. Two
-namespaces, gated by two different key-holders on an upgrade:
+  3. STATEFUL DATA on /data (the per-app sealed volume) for the
+     enclave-upgrade approval scenarios: general app data under /store and
+     data-owner-segregated data under /owner-data/{owner_id}, plus a
+     /insight/{owner_id} that derives a summary over a data owner's records.
 
-  * ``/store/{key}``            — general APP data. Encrypted under the
-    app's own storage key. When the enclave (mini/virtual) OR the app is
-    upgraded, the APP OWNER approves the new measurement and the app
-    storage key is released to it, so /store data carries forward.
-
-  * ``/owner-data/{owner_id}/{key}`` — DATA-OWNER data, segregated per
-    data owner. In the full model each data owner's slice is wrapped with
-    that owner's vault key, so on an upgrade EACH data owner independently
-    approves the new measurement before their slice is readable again;
-    a data owner who declines keeps their data locked to the old version.
-    (The app provides the data surface here; the per-owner key-wrapping is
-    the Phase G data-owner-keys infrastructure.)
-
-The launcher injects ``PRIVASYS_CONTAINER_NAME`` and
-``PRIVASYS_CONTAINER_TOKEN``; the manager middleware enforces
-(loopback + token + name) before honouring SDK callbacks.
+The launcher injects PRIVASYS_CONTAINER_NAME and PRIVASYS_CONTAINER_TOKEN;
+the manager middleware enforces (loopback + token + name) before honouring
+SDK callbacks (the attestation-extensions commit below).
 """
 
 import base64
@@ -48,17 +34,14 @@ import json
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-# ── Per-app state ────────────────────────────────────────────────────
-_CONFIG_LOCK = threading.Lock()
-_CONFIGURED = False  # in-memory: re-armed on every container restart
+# ── Paths on the per-app sealed volume ───────────────────────────────
 _DATA_DIR = Path("/data")
 _KEY_PATH = _DATA_DIR / "api_key"
-
-# Stateful-data roots on the per-app sealed volume.
-_STORE_DIR = _DATA_DIR / "store"            # general app data
+_STORE_DIR = _DATA_DIR / "store"            # general app data / datasets
 _OWNERS_DIR = _DATA_DIR / "owners"          # data-owner-segregated data
 
 # Keys/owner-ids are path components on the sealed volume — keep them to
@@ -69,14 +52,8 @@ _MANAGER_HOST = "127.0.0.1"
 _MANAGER_PORT = 9443
 
 # Bumped per release so the deployed measurement (image digest at OID 3.2)
-# changes and the two versions are distinguishable at runtime via /version.
-#
-# v2.0.0 adds GET /insight/{owner_id}: it DERIVES a summary from a data
-# owner's stored data (a new use of their data). Because the measurement
-# changes, each data owner independently approves the v2 measurement against
-# their own vault key before their slice is readable — a data owner who
-# declines keeps their data locked to v1, which has no insight API.
-APP_VERSION = "2.0.0"
+# changes and versions are distinguishable at runtime via /version.
+APP_VERSION = "3.0.0"
 
 _PORT = int(os.environ.get("PORT", "8080"))  # platform assigns a host-net port
 _NAME = os.environ.get("PRIVASYS_CONTAINER_NAME", "")
@@ -93,13 +70,9 @@ def _post_to_manager(path: str, body: dict) -> tuple[int, bytes]:
     conn = http.client.HTTPConnection(_MANAGER_HOST, _MANAGER_PORT, timeout=5)
     try:
         conn.request(
-            "POST",
-            path,
-            body=json.dumps(body),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {_TOKEN}",
-            },
+            "POST", path, body=json.dumps(body),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {_TOKEN}"},
         )
         resp = conn.getresponse()
         return resp.status, resp.read()
@@ -108,7 +81,11 @@ def _post_to_manager(path: str, body: dict) -> tuple[int, bytes]:
 
 
 def _do_configure(api_key: str) -> None:
-    """Persist + commit + unfreeze. Raises on any failure."""
+    """Persist the secret and commit its hash to the RA-TLS leaf.
+
+    No freeze bookkeeping here: returning 2xx from /configure is what lifts
+    the manager's gate. We deliberately do NOT call config-complete.
+    """
     if not api_key:
         raise ValueError("api_key must be non-empty")
 
@@ -116,23 +93,18 @@ def _do_configure(api_key: str) -> None:
     _KEY_PATH.write_text(api_key)
     os.chmod(_KEY_PATH, 0o600)
 
+    # Commit SHA-256(api_key) to the next per-container RA-TLS leaf so
+    # verifying clients can prove the app saw exactly the delivered key
+    # without ever seeing it. This is an attestation feature, not freeze
+    # logic.
     digest = hashlib.sha256(api_key.encode("utf-8")).digest()
     status, body = _post_to_manager(
         f"/api/v1/containers/{_NAME}/attestation-extensions",
-        {
-            "oid": "1.3.6.1.4.1.65230.3.5.1",
-            "value_b64": base64.standard_b64encode(digest).decode("ascii"),
-        },
+        {"oid": "1.3.6.1.4.1.65230.3.5.1",
+         "value_b64": base64.standard_b64encode(digest).decode("ascii")},
     )
     if status >= 300:
         raise RuntimeError(f"manager attestation-extensions: {status} {body!r}")
-
-    status, body = _post_to_manager(
-        f"/api/v1/containers/{_NAME}/config-complete",
-        {},
-    )
-    if status >= 300:
-        raise RuntimeError(f"manager config-complete: {status} {body!r}")
 
 
 # ── Stateful-data helpers ────────────────────────────────────────────
@@ -141,18 +113,49 @@ def _safe(component: str) -> bool:
     return bool(_SAFE.match(component or ""))
 
 
-def _store_path(key: str) -> Path:
-    return _STORE_DIR / key
-
-
-def _owner_path(owner_id: str, key: str) -> Path:
-    return _OWNERS_DIR / owner_id / key
-
-
 def _write_value(path: Path, value: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(value)
     os.chmod(path, 0o600)
+
+
+def _list_keys(d: Path) -> list[str]:
+    try:
+        return sorted(p.name for p in d.iterdir() if p.is_file())
+    except FileNotFoundError:
+        return []
+
+
+# ── Action: process (long-running, progress-tracked) ─────────────────
+# A tiny simulated job so the portal/CLI can exercise the progress channel
+# declared in the manifest (GET /actions/process/status).
+_JOB_LOCK = threading.Lock()
+_JOB = {"state": "idle", "progress": 0.0, "message": "", "dataset": ""}
+
+
+def _run_process(dataset: str) -> None:
+    steps = 10
+    for i in range(1, steps + 1):
+        time.sleep(0.5)
+        with _JOB_LOCK:
+            if _JOB["state"] != "running":
+                return
+            _JOB["progress"] = i / steps
+            _JOB["message"] = f"processing {dataset} ({i}/{steps})"
+    with _JOB_LOCK:
+        _JOB.update(state="done", progress=1.0,
+                    message=f"processed dataset {dataset!r}")
+
+
+def _start_process(dataset: str) -> dict:
+    with _JOB_LOCK:
+        if _JOB["state"] == "running":
+            return {"error": "a job is already running", "state": "running"}
+        _JOB.update(state="running", progress=0.0,
+                    message=f"starting {dataset}", dataset=dataset)
+    threading.Thread(target=_run_process, args=(dataset,), daemon=True).start()
+    with _JOB_LOCK:
+        return dict(_JOB)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -164,27 +167,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _is_frozen_for(self, path: str) -> bool:
-        # Health check is always available so the manager's readiness
-        # probe can see the container is up even before configuration.
-        # /version is open too so the deployed measurement can be
-        # identified before the app is configured.
-        if path in ("/health", "/version"):
-            return False
-        with _CONFIG_LOCK:
-            return not _CONFIGURED
-
     def _read_body(self) -> bytes:
         length = int(self.headers.get("Content-Length", "0") or 0)
         return self.rfile.read(length) if length else b""
 
+    def _json_body(self) -> tuple[dict, str | None]:
+        try:
+            return json.loads(self._read_body() or b"{}"), None
+        except json.JSONDecodeError:
+            return {}, "invalid JSON body"
+
     # ── GET ──────────────────────────────────────────────────────────
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
-        if self._is_frozen_for(path):
-            self._json(503, {"error": "app is awaiting initial configuration"})
-            return
-
         if path == "/health":
             self._json(200, {"status": "healthy"})
         elif path == "/version":
@@ -196,12 +191,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json(500, {"error": "api_key file missing"})
                 return
             self._json(200, {"status": "ok", "api_key_length": len(key)})
+        elif path == "/datasets":
+            # Dynamic enum source for the `process` action.
+            self._json(200, {"available": _list_keys(_STORE_DIR)})
+        elif path == "/actions/process/status":
+            with _JOB_LOCK:
+                self._json(200, dict(_JOB))
         elif path == "/":
             self._json(200, {"status": "ok", "name": _NAME, "version": APP_VERSION})
         elif path.startswith("/store/"):
             self._get_store(path[len("/store/"):])
         elif path == "/store":
-            self._list_dir(_STORE_DIR)
+            keys = _list_keys(_STORE_DIR)
+            self._json(200, {"keys": keys, "count": len(keys)})
         elif path.startswith("/owner-data/"):
             self._get_owner_data(path[len("/owner-data/"):])
         elif path.startswith("/insight/"):
@@ -214,7 +216,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(400, {"error": "invalid key"})
             return
         try:
-            value = _store_path(key).read_bytes()
+            value = (_STORE_DIR / key).read_bytes()
         except FileNotFoundError:
             self._json(404, {"error": "key not found"})
             return
@@ -227,15 +229,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(400, {"error": "invalid owner_id"})
             return
         if len(parts) == 1 or parts[1] == "":
-            # List a data owner's keys.
-            self._list_dir(_OWNERS_DIR / owner_id, label="owner_id", label_value=owner_id)
+            keys = _list_keys(_OWNERS_DIR / owner_id)
+            self._json(200, {"owner_id": owner_id, "keys": keys, "count": len(keys)})
             return
         key = parts[1]
         if not _safe(key):
             self._json(400, {"error": "invalid key"})
             return
         try:
-            value = _owner_path(owner_id, key).read_bytes()
+            value = (_OWNERS_DIR / owner_id / key).read_bytes()
         except FileNotFoundError:
             self._json(404, {"error": "key not found"})
             return
@@ -243,21 +245,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                          "value": value.decode("utf-8", "replace")})
 
     def _get_insight(self, owner_id: str) -> None:
-        """v2 API: derive a summary insight over a data owner's stored data.
-
-        This is the new capability v2 introduces. It reads every record the
-        data owner has stored under /owner-data/{owner_id}/ and returns a
-        derived summary. In the data-owner-key model the owner's slice is
-        only readable here after the owner has approved the v2 measurement
-        against their vault key; otherwise this returns an empty insight.
-        """
+        """Derive a summary insight over a data owner's stored data."""
         if not _safe(owner_id):
             self._json(400, {"error": "invalid owner_id"})
             return
         owner_dir = _OWNERS_DIR / owner_id
-        records = 0
-        total_bytes = 0
-        longest = 0
+        records = total_bytes = longest = 0
         fingerprint = hashlib.sha256()
         try:
             files = sorted(p for p in owner_dir.iterdir() if p.is_file())
@@ -271,66 +264,113 @@ class Handler(http.server.BaseHTTPRequestHandler):
             fingerprint.update(p.name.encode("utf-8"))
             fingerprint.update(blob)
         self._json(200, {
-            "owner_id": owner_id,
-            "app_version": APP_VERSION,
-            "insight": {
-                "records": records,
-                "total_bytes": total_bytes,
-                "longest_value_bytes": longest,
-                "fingerprint": fingerprint.hexdigest(),
-            },
+            "owner_id": owner_id, "app_version": APP_VERSION,
+            "insight": {"records": records, "total_bytes": total_bytes,
+                        "longest_value_bytes": longest,
+                        "fingerprint": fingerprint.hexdigest()},
         })
-
-    def _list_dir(self, d: Path, label: str | None = None,
-                  label_value: str | None = None) -> None:
-        try:
-            keys = sorted(p.name for p in d.iterdir() if p.is_file())
-        except FileNotFoundError:
-            keys = []
-        out: dict = {"keys": keys, "count": len(keys)}
-        if label:
-            out[label] = label_value
-        self._json(200, out)
 
     # ── POST ─────────────────────────────────────────────────────────
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
-
         if path == "/configure":
             self._configure()
-            return
-
-        if self._is_frozen_for(path):
-            self._json(503, {"error": "app is awaiting initial configuration"})
-            return
-
-        if path.startswith("/store/"):
+        elif path == "/actions/process":
+            self._action_process()
+        # status/source tools are reachable over the unary /rpc relay, which
+        # POSTs; accept POST on the read endpoints too (body ignored).
+        elif path == "/datasets":
+            self._json(200, {"available": _list_keys(_STORE_DIR)})
+        elif path == "/actions/process/status":
+            with _JOB_LOCK:
+                self._json(200, dict(_JOB))
+        elif path == "/store":
+            self._put_store_body()
+        elif path == "/fetch":
+            self._fetch_body()
+        elif path.startswith("/store/"):
             self._put_store(path[len("/store/"):])
         elif path.startswith("/owner-data/"):
             self._put_owner_data(path[len("/owner-data/"):])
         else:
             self._json(404, {"error": "not found"})
 
-    def _value_from_body(self) -> tuple[bytes | None, str | None]:
-        raw = self._read_body()
+    def _configure(self) -> None:
+        payload, err = self._json_body()
+        if err:
+            self._json(400, {"error": err})
+            return
+        api_key = payload.get("api_key", "")
+        if not isinstance(api_key, str) or not api_key:
+            self._json(400, {"error": "api_key (string) is required"})
+            return
         try:
-            payload = json.loads(raw or b"{}")
-        except json.JSONDecodeError:
-            return None, "invalid JSON body"
-        value = payload.get("value")
+            _do_configure(api_key)
+        except Exception as exc:  # noqa: BLE001 — surface manager error
+            self._json(500, {"error": str(exc)})
+            return
+        # A plain 2xx is what lifts the manager's freeze gate.
+        self._json(200, {"status": "configured"})
+
+    def _action_process(self) -> None:
+        payload, err = self._json_body()
+        if err:
+            self._json(400, {"error": err})
+            return
+        dataset = payload.get("dataset", "")
+        if not isinstance(dataset, str) or not _safe(dataset):
+            self._json(400, {"error": "dataset (a stored key) is required"})
+            return
+        if not (_STORE_DIR / dataset).is_file():
+            self._json(404, {"error": f"dataset {dataset!r} not found under /store"})
+            return
+        result = _start_process(dataset)
+        self._json(202 if "error" not in result else 409, result)
+
+    def _put_store_body(self) -> None:
+        payload, err = self._json_body()
+        if err:
+            self._json(400, {"error": err})
+            return
+        key, value = payload.get("key"), payload.get("value")
+        if not isinstance(key, str) or not _safe(key):
+            self._json(400, {"error": "invalid key"})
+            return
         if not isinstance(value, str):
-            return None, "value (string) is required"
-        return value.encode("utf-8"), None
+            self._json(400, {"error": "value (string) is required"})
+            return
+        _write_value(_STORE_DIR / key, value.encode("utf-8"))
+        self._json(200, {"status": "stored", "key": key, "bytes": len(value)})
+
+    def _fetch_body(self) -> None:
+        payload, err = self._json_body()
+        if err:
+            self._json(400, {"error": err})
+            return
+        key = payload.get("key")
+        if not isinstance(key, str) or not _safe(key):
+            self._json(400, {"error": "invalid key"})
+            return
+        try:
+            value = (_STORE_DIR / key).read_bytes()
+        except FileNotFoundError:
+            self._json(404, {"error": "key not found"})
+            return
+        self._json(200, {"key": key, "value": value.decode("utf-8", "replace")})
 
     def _put_store(self, key: str) -> None:
         if not _safe(key):
             self._json(400, {"error": "invalid key"})
             return
-        value, err = self._value_from_body()
+        payload, err = self._json_body()
         if err:
             self._json(400, {"error": err})
             return
-        _write_value(_store_path(key), value)
+        value = payload.get("value")
+        if not isinstance(value, str):
+            self._json(400, {"error": "value (string) is required"})
+            return
+        _write_value(_STORE_DIR / key, value.encode("utf-8"))
         self._json(200, {"status": "stored", "key": key, "bytes": len(value)})
 
     def _put_owner_data(self, rest: str) -> None:
@@ -342,33 +382,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not _safe(owner_id) or not _safe(key):
             self._json(400, {"error": "invalid owner_id or key"})
             return
-        value, err = self._value_from_body()
+        payload, err = self._json_body()
         if err:
             self._json(400, {"error": err})
             return
-        _write_value(_owner_path(owner_id, key), value)
+        value = payload.get("value")
+        if not isinstance(value, str):
+            self._json(400, {"error": "value (string) is required"})
+            return
+        _write_value(_OWNERS_DIR / owner_id / key, value.encode("utf-8"))
         self._json(200, {"status": "stored", "owner_id": owner_id,
                          "key": key, "bytes": len(value)})
-
-    def _configure(self) -> None:
-        try:
-            payload = json.loads(self._read_body() or b"{}")
-        except json.JSONDecodeError:
-            self._json(400, {"error": "invalid JSON body"})
-            return
-        api_key = payload.get("api_key", "")
-        if not isinstance(api_key, str) or not api_key:
-            self._json(400, {"error": "api_key (string) is required"})
-            return
-        try:
-            _do_configure(api_key)
-        except Exception as exc:  # noqa: BLE001 — surface manager error
-            self._json(500, {"error": str(exc)})
-            return
-        global _CONFIGURED
-        with _CONFIG_LOCK:
-            _CONFIGURED = True
-        self._json(200, {"status": "configured"})
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         pass
@@ -376,5 +400,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     server = http.server.HTTPServer(("0.0.0.0", _PORT), Handler)
-    print(f"container-app-example listening on :{_PORT} (name={_NAME or '<unset>'})")
+    print(f"container-app-example-with-config listening on :{_PORT} "
+          f"(name={_NAME or '<unset>'}, version={APP_VERSION})")
     server.serve_forever()

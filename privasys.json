@@ -6,27 +6,98 @@
     "tools": [
         {
             "name": "configure",
-            "description": "Inject the API key the app needs before it can serve traffic. Must be called once per container restart; the runtime keeps every other endpoint at HTTP 503 until this succeeds.",
+            "role": "config",
+            "description": "Inject the API key the app needs before it serves traffic. The runtime keeps every other endpoint at HTTP 503 until this succeeds, and re-arms the gate on each restart. The app stores the key in the per-app sealed volume and commits SHA-256(key) to the RA-TLS leaf at OID 1.3.6.1.4.1.65230.3.5.1.",
             "endpoint": "/configure",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "api_key": {
                         "type": "string",
-                        "description": "Secret API key. Stored in the per-app sealed volume; SHA-256 of the value is committed to the per-container RA-TLS leaf at OID 1.3.6.1.4.1.65230.3.5.1."
+                        "description": "Secret API key.",
+                        "x-privasys": { "secret": true, "label": "API key" }
                     }
                 },
                 "required": ["api_key"]
             }
         },
         {
-            "name": "protected",
-            "description": "Returns 200 with the configured API key length once the app has been configured; HTTP 503 otherwise.",
-            "endpoint": "/protected",
+            "name": "process",
+            "role": "action",
+            "description": "Run a short job over a stored dataset. Demonstrates a dynamic enum input (the dataset list is fetched live via the datasets tool) and a progress-tracked long-running action (polled via the process_status tool).",
+            "endpoint": "/actions/process",
             "inputSchema": {
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "dataset": {
+                        "type": "string",
+                        "description": "One of the datasets currently stored under /store.",
+                        "x-privasys": {
+                            "label": "Dataset",
+                            "source": { "tool": "datasets", "select": "available" }
+                        }
+                    }
+                },
+                "required": ["dataset"]
+            },
+            "x-privasys": {
+                "progress": {
+                    "tool": "process_status",
+                    "stateField": "state",
+                    "progressField": "progress",
+                    "messageField": "message",
+                    "terminal": { "success": ["done"], "failure": ["failed"] }
+                }
+            }
+        },
+        {
+            "name": "datasets",
+            "role": "status",
+            "description": "List the datasets (stored keys) available to the process action. Used as the live source for the process.dataset enum.",
+            "endpoint": "/datasets",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "process_status",
+            "role": "status",
+            "description": "Current state of the process action: state (idle|running|done|failed), progress (0..1), and message.",
+            "endpoint": "/actions/process/status",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "store",
+            "description": "Write a value to the app's per-app sealed volume (/data). Survives restarts and upgrades; the host never sees the encryption key or the plaintext.",
+            "endpoint": "/store",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "Key (alphanumerics, dot, dash, underscore; max 128 chars)." },
+                    "value": { "type": "string", "description": "Value to store." }
+                },
+                "required": ["key", "value"]
+            }
+        },
+        {
+            "name": "fetch",
+            "description": "Read a value previously written with store from the per-app sealed volume.",
+            "endpoint": "/fetch",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "Key to read." }
+                },
+                "required": ["key"]
             }
         }
-    ]
+    ],
+    "store": {
+        "tagline": "Container starter app for the typed config + actions design: configure-then-freeze plus a progress-tracked action with a dynamic enum, all on the schema/RPC surface.",
+        "category": "Developer Tools",
+        "keywords": "container, example, configure, freeze gate, actions, secret injection, ra-tls, attestation, enclave os, tdx, confidential computing, sealed storage, mcp",
+        "website_url": "https://privasys.org",
+        "support_email": "contact@privasys.org",
+        "privacy_url": "https://privasys.org/legal/privacy/",
+        "tos_url": "https://privasys.org/legal/terms/",
+        "description": "Container Example (with config) is the reference application for the typed config + actions capabilities on the Privasys container runtime.\n\nONE SCHEMA SURFACE\nConfig and actions are role-tagged tools on the same schema/RPC surface the API Test tab uses: each is invoked via unary /rpc/{name}. The portal Configure tab and Manage panel are native renderings of the config-role and action-role tools; agents reach the same tools over MCP.\n\nCONFIGURE-THEN-FREEZE (manager-gated)\nThe tool with role config drives the freeze gate. On deploy, the runtime keeps every endpoint other than the configure endpoint at HTTP 503 until the owner submits the configuration. The app itself contains NO freeze logic: the gate lives at the routing layer and lifts automatically on the first successful configure response. The gate re-arms on each restart.\n\nTYPED ACTIONS\nThe action tool (process) has a dynamic enum input (sourced live from the datasets tool) and a progress channel (polled via the process_status tool), so the portal, CLI, and MCP can render and drive it natively with no app-specific platform code.\n\nWHO IT IS FOR\nDevelopers who need to provision a secret into an enclave app at deploy time (attested) and expose typed operations to the portal, CLI, and agents."
+    }
 }

@@ -106,7 +106,7 @@ traffic flows. Persisted attestation extensions on the leaf survive too.
 docker build -t privasys/container-app-example-with-config .
 docker run --rm -e PRIVASYS_CONTAINER_NAME=demo \
                 -e PRIVASYS_CONTAINER_TOKEN=$(openssl rand -hex 32) \
-                -p 8080:8080 privasys/container-app-example-with-config
+                -e PORT=8000 -p 8000:8000 privasys/container-app-example-with-config
 ```
 
 `/configure` will fail with a connection error outside the enclave (no

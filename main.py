@@ -55,7 +55,10 @@ _MANAGER_PORT = 9443
 # changes and versions are distinguishable at runtime via /version.
 APP_VERSION = "3.0.0"
 
-_PORT = int(os.environ.get("PORT", "8080"))  # platform assigns a host-net port
+_port = os.environ.get("PORT")  # platform assigns a host-net port; required, no fallback
+if not _port:
+    raise SystemExit("PORT environment variable is required")
+_PORT = int(_port)
 _NAME = os.environ.get("PRIVASYS_CONTAINER_NAME", "")
 _TOKEN = os.environ.get("PRIVASYS_CONTAINER_TOKEN", "")
 

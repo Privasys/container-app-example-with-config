@@ -1,5 +1,5 @@
-# Copyright (c) Privasys. All rights reserved.
-# Licensed under the GNU Affero General Public License v3.0.
+# Copyright (c) 2026 Privasys.
+# Licensed under the MIT License.
 #
 # Build-check on every push/PR; publish + release ONLY on a `v*` git tag.
 # Used to exercise the enclave-upgrade flow: deploy one tag, then a second
@@ -32,7 +32,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Build (verify the image compiles)
         run: docker build -t cawc-check .
 
@@ -45,17 +45,17 @@ jobs:
       packages: write      # push to GHCR
       id-token: write       # cosign keyless (Fulcio/Rekor OIDC)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Resolve tag
         id: tag
@@ -72,7 +72,7 @@ jobs:
           fi
 
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true

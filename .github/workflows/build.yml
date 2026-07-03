@@ -1,30 +1,49 @@
 # Copyright (c) Privasys. All rights reserved.
 # Licensed under the GNU Affero General Public License v3.0.
 #
-# Build & push the container-app-example-with-config image to GHCR. Each push of a
-# `v*` tag produces ghcr.io/privasys/container-app-example-with-config:<tag> and a
-# :<tag>-<sha> immutable tag. Used to exercise the enclave-upgrade flow:
-# deploy one tag, then a second (a code change → a different image digest)
-# to test the vault key gate + app-owner / data-owner promotion.
+# Build-check on every push/PR; publish + release ONLY on a `v*` git tag.
+# Used to exercise the enclave-upgrade flow: deploy one tag, then a second
+# (a code change -> a different image digest) to test the vault key gate +
+# app-owner / data-owner promotion.
+#
+# Platform contract (management-service):
+#   - A deployable "version" == a TAG on the GHCR image (ListImageTags reads
+#     registry tags). We publish exactly ONE semver tag per git tag -> no
+#     tag, no image. The old :<tag>-<sha> variant is dropped (mgmt filters it
+#     out; the release records the digest anyway).
+#   - Single-arch linux/amd64 + provenance/sbom off: an OCI attestation index
+#     would change the digest the enclave pins at OID 1.3.6.1.4.1.65230.3.2.
+#   - Each release records that digest (Measurements table) and cosign-signs it.
 
-name: Build & Push container-app-example-with-config
+name: Build and Release container-app-example-with-config
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
+  pull_request:
   workflow_dispatch:
-
-permissions:
-  contents: read
-  packages: write
 
 env:
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/privasys/container-app-example-with-config
 
 jobs:
-  build:
+  check:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (verify the image compiles)
+        run: docker build -t cawc-check .
+
+  build:
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # cut the GitHub Release
+      packages: write      # push to GHCR
+      id-token: write       # cosign keyless (Fulcio/Rekor OIDC)
     steps:
       - uses: actions/checkout@v4
 
@@ -40,20 +59,70 @@ jobs:
 
       - name: Resolve tag
         id: tag
-        run: |
-          REF="${GITHUB_REF#refs/tags/}"
-          [ "$GITHUB_REF" = "${GITHUB_REF#refs/tags/}" ] && REF="manual-$(git rev-parse --short HEAD)"
-          echo "tag=$REF" >> "$GITHUB_OUTPUT"
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      # Embed privasys.json (MCP manifest) as the org.privasys.manifest OCI
+      # label so mgmt-service auto-detects tools/UI. base64 survives the CSV
+      # label parser; mgmt decodes it.
+      - name: Read privasys.json
+        id: manifest
+        run: |
+          if [ -f privasys.json ]; then
+            echo "json=$(jq -c . privasys.json | base64 -w0)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          # linux/amd64 only — the TDX enclave is amd64; a multi-arch index
-          # would change the digest the platform pins at OID 3.2.
           platforms: linux/amd64
           provenance: false
-          tags: |
-            ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
-            ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}-${{ github.sha }}
+          sbom: false
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+          labels: org.privasys.manifest=${{ steps.manifest.outputs.json }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless)
+        run: cosign sign --yes "${IMAGE}@${{ steps.build.outputs.digest }}"
+
+      - name: Cut GitHub Release (Measurements)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          cat > notes.md <<EOF
+          ## Measurements
+
+          | Measurement | Value |
+          |-------------|-------|
+          | **Workload image digest** | \`${DIGEST}\` |
+          | **Attestation OID** | \`1.3.6.1.4.1.65230.3.2\` |
+          | **Pinned reference** | \`${IMAGE}@${DIGEST}\` |
+          | **Source commit** | \`${SHA}\` |
+
+          The workload image digest is the SHA-256 manifest digest of the published
+          container image. The enclave measures it into the RA-TLS leaf certificate
+          at OID **1.3.6.1.4.1.65230.3.2**; clients verify the running app is exactly
+          this image by inspecting the TDX quote in the server certificate. The image
+          is cosign-signed (keyless, Fulcio/Rekor) against the same digest.
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md --generate-notes --verify-tag
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "## ${{ steps.tag.outputs.tag }} published"
+            echo
+            echo '```'
+            echo "${IMAGE}@${{ steps.build.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

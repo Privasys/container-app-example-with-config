@@ -13,7 +13,7 @@
 #     out; the release records the digest anyway).
 #   - Single-arch linux/amd64 + provenance/sbom off: an OCI attestation index
 #     would change the digest the enclave pins at OID 1.3.6.1.4.1.65230.3.2.
-#   - Each release records that digest (Measurements table) and cosign-signs it.
+#   - Each release records that digest in a Measurements table.
 
 name: Build and Release container-app-example-with-config
 
@@ -43,7 +43,6 @@ jobs:
     permissions:
       contents: write      # cut the GitHub Release
       packages: write      # push to GHCR
-      id-token: write       # cosign keyless (Fulcio/Rekor OIDC)
     steps:
       - uses: actions/checkout@v6
 
@@ -82,12 +81,6 @@ jobs:
           tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
           labels: org.privasys.manifest=${{ steps.manifest.outputs.json }}
 
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: Sign image (keyless)
-        run: cosign sign --yes "${IMAGE}@${{ steps.build.outputs.digest }}"
-
       - name: Cut GitHub Release (Measurements)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -108,8 +101,7 @@ jobs:
           The workload image digest is the SHA-256 manifest digest of the published
           container image. The enclave measures it into the RA-TLS leaf certificate
           at OID **1.3.6.1.4.1.65230.3.2**; clients verify the running app is exactly
-          this image by inspecting the TDX quote in the server certificate. The image
-          is cosign-signed (keyless, Fulcio/Rekor) against the same digest.
+          this image by inspecting the TDX quote in the server certificate.
           EOF
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --notes-file notes.md

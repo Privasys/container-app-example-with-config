@@ -48,8 +48,13 @@ _OWNERS_DIR = _DATA_DIR / "owners"          # data-owner-segregated data
 # a safe charset so they can never escape their namespace.
 _SAFE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
-_MANAGER_HOST = "127.0.0.1"
-_MANAGER_PORT = 9443
+# Manager callback address. Since per-container network namespaces landed
+# (enclave-os-virtual #45) a container reaches the manager at the bridge gateway
+# via the injected PRIVASYS_MANAGER_URL, not its own 127.0.0.1. Fall back to the
+# pre-#45 loopback for older runtimes.
+_mgr = urlparse(os.environ.get("PRIVASYS_MANAGER_URL", "http://127.0.0.1:9443"))
+_MANAGER_HOST = _mgr.hostname or "127.0.0.1"
+_MANAGER_PORT = _mgr.port or 9443
 
 # Bumped per release so the deployed measurement (image digest at OID 3.2)
 # changes and versions are distinguishable at runtime via /version.

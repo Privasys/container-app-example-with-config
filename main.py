@@ -58,7 +58,7 @@ _MANAGER_PORT = _mgr.port or 9443
 
 # Bumped per release so the deployed measurement (image digest at OID 3.2)
 # changes and versions are distinguishable at runtime via /version.
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.0.2"
 
 _port = os.environ.get("PORT")  # platform assigns a host-net port; required, no fallback
 if not _port:
